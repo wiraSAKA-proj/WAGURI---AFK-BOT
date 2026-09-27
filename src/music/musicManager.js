@@ -1,3 +1,5 @@
+const https = require('https');
+const http = require('http');
 const {
   createAudioPlayer,
   createAudioResource,
@@ -8,7 +10,7 @@ const {
 const prism = require('prism-media');
 const ffmpegPath = require('ffmpeg-static');
 
-// state per guild: { player, ffmpegProcess, isPlaying }
+// state per guild: { player, ffmpegProcess, httpRequest, isPlaying }
 const musicStates = new Map();
 
 function getDefaultStreamUrl() {
@@ -22,6 +24,7 @@ function getMusicState(guildId) {
     musicStates.set(guildId, {
       player: null,
       ffmpegProcess: null,
+      httpRequest: null,
       isPlaying: false,
     });
   }
@@ -33,43 +36,100 @@ function isPlaying(guildId) {
 }
 
 /**
- * Membuat stream PCM (s16le, 48kHz, stereo) dari URL stream radio menggunakan ffmpeg,
- * sehingga bisa langsung dikonsumsi oleh @discordjs/voice.
+ * Mengambil stream HTTP/HTTPS memakai modul bawaan Node (bukan ffmpeg), agar tidak
+ * bergantung pada dukungan protokol https di binary ffmpeg-static (yang sering tidak
+ * disertakan). Mengikuti redirect (umum terjadi pada URL radio internet).
  */
-function createPcmStream(streamUrl) {
-  return new prism.FFmpeg({
+function fetchHttpStream(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const lib = url.startsWith('https') ? https : http;
+
+    const request = lib.get(url, { headers: { 'User-Agent': 'WAGURI-AFK-BOT' } }, (res) => {
+      const status = res.statusCode || 0;
+
+      if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirectsLeft > 0) {
+        res.resume();
+        settled = true;
+        resolve(fetchHttpStream(res.headers.location, redirectsLeft - 1));
+        return;
+      }
+
+      if (status !== 200) {
+        settled = true;
+        res.resume();
+        reject(new Error(`Stream merespons HTTP ${status}`));
+        return;
+      }
+
+      settled = true;
+      resolve({ response: res, request });
+    });
+
+    request.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+
+    request.setTimeout(10_000, () => {
+      if (!settled) {
+        settled = true;
+        request.destroy(new Error('Timeout saat menghubungi server stream.'));
+      }
+    });
+  });
+}
+
+/**
+ * Membuat transcoder ffmpeg yang membaca PCM dari stdin (bukan langsung dari URL),
+ * lalu mengeluarkan PCM s16le 48kHz stereo yang siap dipakai @discordjs/voice.
+ */
+function createTranscoder() {
+  const transcoder = new prism.FFmpeg({
     command: ffmpegPath,
     args: [
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
-      '-i', streamUrl,
       '-analyzeduration', '0',
-      '-loglevel', '0',
+      '-loglevel', 'error',
+      '-i', 'pipe:0',
       '-f', 's16le',
       '-ar', '48000',
       '-ac', '2',
     ],
   });
+
+  transcoder.process.stderr?.on('data', (chunk) => {
+    const message = chunk.toString().trim();
+    if (message) {
+      console.error(`[ERROR] ffmpeg: ${message}`);
+    }
+  });
+
+  return transcoder;
 }
 
 /**
  * Memutar musik lofi chill pada voice connection yang diberikan.
  * Resolve saat player berhasil mulai playing, reject jika gagal/error.
  */
-function playMusic(guildId, connection, streamUrl = getDefaultStreamUrl()) {
+async function playMusic(guildId, connection, streamUrl = getDefaultStreamUrl()) {
+  const state = getMusicState(guildId);
+
+  // Hentikan player/stream lama jika masih ada, agar tidak dobel.
+  stopMusic(guildId);
+
+  let httpResult;
+  try {
+    httpResult = await fetchHttpStream(streamUrl);
+  } catch (err) {
+    throw new Error(`Gagal mengambil stream: ${err.message}`);
+  }
+
+  const { response: httpResponse, request: httpRequest } = httpResult;
+
   return new Promise((resolve, reject) => {
-    const state = getMusicState(guildId);
-
-    // Hentikan player/stream lama jika masih ada, agar tidak dobel.
-    stopMusic(guildId);
-
-    let pcmStream;
-    try {
-      pcmStream = createPcmStream(streamUrl);
-    } catch (err) {
-      return reject(new Error(`Gagal membuat stream audio: ${err.message}`));
-    }
+    const transcoder = createTranscoder();
 
     const player = createAudioPlayer({
       behaviors: {
@@ -77,12 +137,13 @@ function playMusic(guildId, connection, streamUrl = getDefaultStreamUrl()) {
       },
     });
 
-    const resource = createAudioResource(pcmStream, {
+    const resource = createAudioResource(transcoder, {
       inputType: StreamType.Raw,
     });
 
     state.player = player;
-    state.ffmpegProcess = pcmStream;
+    state.ffmpegProcess = transcoder;
+    state.httpRequest = httpRequest;
     state.isPlaying = false;
 
     let settled = false;
@@ -119,8 +180,8 @@ function playMusic(guildId, connection, streamUrl = getDefaultStreamUrl()) {
       }
     });
 
-    pcmStream.on('error', (error) => {
-      console.error(`[ERROR] Stream error di guild ${guildId}:`, error.message);
+    transcoder.on('error', (error) => {
+      console.error(`[ERROR] ffmpeg transcoder error di guild ${guildId}:`, error.message);
       state.isPlaying = false;
       if (!settled) {
         settled = true;
@@ -129,13 +190,25 @@ function playMusic(guildId, connection, streamUrl = getDefaultStreamUrl()) {
       }
     });
 
+    httpResponse.on('error', (error) => {
+      console.error(`[ERROR] HTTP stream error di guild ${guildId}:`, error.message);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId);
+        reject(error);
+      }
+    });
+
+    // Alirkan data mentah (mp3/aac) dari HTTP response ke ffmpeg untuk di-transcode.
+    httpResponse.pipe(transcoder);
+
     connection.subscribe(player);
     player.play(resource);
   });
 }
 
 /**
- * Menghentikan musik dan membersihkan resource (player + proses ffmpeg).
+ * Menghentikan musik dan membersihkan resource (player, proses ffmpeg, request HTTP).
  * Tidak memutuskan voice connection - itu tanggung jawab voiceManager.
  */
 function stopMusic(guildId) {
@@ -154,6 +227,15 @@ function stopMusic(guildId) {
       // aman untuk diabaikan jika proses sudah berhenti
     }
     state.ffmpegProcess = null;
+  }
+
+  if (state.httpRequest) {
+    try {
+      state.httpRequest.destroy();
+    } catch (err) {
+      // aman untuk diabaikan jika request sudah selesai
+    }
+    state.httpRequest = null;
   }
 
   state.isPlaying = false;
