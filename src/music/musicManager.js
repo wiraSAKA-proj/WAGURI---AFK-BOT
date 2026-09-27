@@ -281,8 +281,45 @@ function getSpotifyTrackTitle(spotifyUrl) {
   });
 }
 
+/**
+ * Menjalankan fn() dengan retry otomatis khusus untuk error rate-limit (HTTP 429)
+ * dari YouTube. Server hosting cloud (Railway/Render/dll) kadang kena rate limit
+ * karena IP-nya dipakai bersama banyak pengguna lain.
+ */
+async function withRetry(fn, retries = 2, delayMs = 2000) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const isRateLimited = err.message && err.message.includes('429');
+      if (!isRateLimited || attempt === retries) {
+        throw err;
+      }
+      console.log(`[MUSIC] Kena rate limit YouTube (429), coba ulang (${attempt + 1}/${retries})...`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+function friendlyError(err) {
+  if (err.message && err.message.includes('429')) {
+    return new Error(
+      'YouTube sedang membatasi request dari server bot ini (rate limit). Coba lagi dalam beberapa saat.'
+    );
+  }
+  return err;
+}
+
 async function searchYoutube(query) {
-  const results = await play.search(query, { limit: 1, source: { youtube: 'video' } });
+  let results;
+  try {
+    results = await withRetry(() => play.search(query, { limit: 1, source: { youtube: 'video' } }));
+  } catch (err) {
+    throw friendlyError(err);
+  }
   if (!results || results.length === 0) {
     throw new Error(`Tidak ditemukan hasil YouTube untuk "${query}".`);
   }
@@ -304,14 +341,10 @@ async function resolveInputToItems(link) {
 
   switch (kind) {
     case 'yt_video': {
-      let title = trimmed;
-      try {
-        const info = await play.video_basic_info(trimmed);
-        title = info.video_details.title;
-      } catch (err) {
-        // kalau gagal ambil judul, tetap lanjut pakai URL sebagai label
-      }
-      return [{ type: 'youtube', url: trimmed, title }];
+      // Sengaja tidak memanggil video_basic_info() di sini untuk mengurangi jumlah
+      // request ke YouTube (mengurangi risiko kena rate limit / HTTP 429). Judul
+      // akan tetap didapat nanti saat proses streaming (lihat playNextInQueue).
+      return [{ type: 'youtube', url: trimmed, title: null }];
     }
 
     case 'yt_playlist': {
@@ -339,7 +372,14 @@ async function resolveInputToItems(link) {
   }
 }
 
-async function playNextInQueue(guildId, connection) {
+/**
+ * Memutar item berikutnya di antrian.
+ * Jika confirmFirstTrack true: promise ini BARU resolve setelah player benar-benar
+ * berhasil "Playing", atau reject jika seluruh sisa antrian gagal diputar (dipakai
+ * saat pertama kali /play_music dijalankan, supaya balasan ke user akurat).
+ * Jika false: dipakai untuk auto-lanjut antar lagu, tidak melempar error keluar.
+ */
+async function playNextInQueue(guildId, connection, confirmFirstTrack = false) {
   const state = getMusicState(guildId);
   stopCurrentPlayer(guildId);
 
@@ -347,14 +387,20 @@ async function playNextInQueue(guildId, connection) {
   if (!item) {
     state.isPlaying = false;
     state.mode = null;
+    if (confirmFirstTrack) {
+      throw new Error('Tidak ada lagu yang berhasil diputar dari antrian.');
+    }
     return;
   }
 
   let streamInfo;
   try {
-    streamInfo = await play.stream(item.url);
+    streamInfo = await withRetry(() => play.stream(item.url));
   } catch (err) {
     console.error(`[ERROR] Gagal stream "${item.title || item.url}" di guild ${guildId}:`, err.message);
+    if (confirmFirstTrack) {
+      throw friendlyError(err);
+    }
     return playNextInQueue(guildId, connection); // coba lagu berikutnya di antrian
   }
 
@@ -369,27 +415,57 @@ async function playNextInQueue(guildId, connection) {
   state.mode = 'queue';
   state.isPlaying = false;
 
-  player.on(AudioPlayerStatus.Playing, () => {
-    state.isPlaying = true;
-    console.log(`[MUSIC] Memutar "${item.title || item.url}" di guild ${guildId}`);
-  });
+  return new Promise((resolve, reject) => {
+    let settled = false;
 
-  player.on(AudioPlayerStatus.Idle, () => {
-    state.isPlaying = false;
-    console.log(`[MUSIC] Track selesai di guild ${guildId}, lanjut ke antrian berikutnya...`);
-    playNextInQueue(guildId, connection).catch((err) => {
-      console.error(`[ERROR] Gagal memutar track berikutnya di guild ${guildId}:`, err.message);
+    const timeoutId = setTimeout(() => {
+      if (!settled && confirmFirstTrack) {
+        settled = true;
+        reject(new Error('Timeout: track tidak kunjung mulai diputar dalam 15 detik.'));
+      }
+    }, 15_000);
+
+    player.on(AudioPlayerStatus.Playing, () => {
+      state.isPlaying = true;
+      console.log(`[MUSIC] Memutar "${item.title || item.url}" di guild ${guildId}`);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId);
+        resolve();
+      }
     });
-  });
 
-  player.on('error', (error) => {
-    console.error(`[ERROR] Audio player error (queue) di guild ${guildId}:`, error.message);
-    state.isPlaying = false;
-    playNextInQueue(guildId, connection).catch(() => {});
-  });
+    player.on(AudioPlayerStatus.Idle, () => {
+      state.isPlaying = false;
+      console.log(`[MUSIC] Track selesai di guild ${guildId}, lanjut ke antrian berikutnya...`);
+      playNextInQueue(guildId, connection).catch((err) => {
+        console.error(`[ERROR] Gagal memutar track berikutnya di guild ${guildId}:`, err.message);
+      });
+    });
 
-  connection.subscribe(player);
-  player.play(resource);
+    player.on('error', (error) => {
+      console.error(`[ERROR] Audio player error (queue) di guild ${guildId}:`, error.message);
+      state.isPlaying = false;
+      clearTimeout(timeoutId);
+
+      if (settled) {
+        // Sudah "Playing" sebelumnya lalu error di tengah jalan -> lanjut ke lagu berikutnya.
+        playNextInQueue(guildId, connection).catch(() => {});
+        return;
+      }
+
+      settled = true;
+      if (confirmFirstTrack) {
+        reject(friendlyError(error));
+      } else {
+        resolve();
+        playNextInQueue(guildId, connection).catch(() => {});
+      }
+    });
+
+    connection.subscribe(player);
+    player.play(resource);
+  });
 }
 
 /**
@@ -409,7 +485,7 @@ async function resolveAndQueue(guildId, connection, link) {
   state.mode = 'queue';
 
   if (startedEmpty) {
-    await playNextInQueue(guildId, connection);
+    await playNextInQueue(guildId, connection, true);
     return { started: true, addedCount: items.length, firstTitle: items[0].title || items[0].url };
   }
 
